@@ -1,0 +1,107 @@
+# Configuración del simulador de empaque de limones
+# ================================================
+# Todos los parámetros son modificables para calibrar el simulador
+
+# --- Turno y granularidad ---
+shift_hours: 8.0          # Duración del turno (horas)
+dt_seconds: 30             # Paso de tiempo para discretización (segundos)
+                           # 10-60 segundos recomendado; muy grande suaviza, muy chico aumenta costo
+
+# --- Tasas de llegada ---
+arrival_rate_kgph: 24000   # kg/h que intentan ingresar (entrada "sin restricción")
+                           # Si es alto (ej. 10x capacidad), el cuello lo define el empaque
+                           # Ajustar según restricciones reales del transportador
+
+# --- Salidas (línea de empaque) ---
+# Total: 18 máquinas
+# 0-3: AUTO (2280 kg/h)
+# 4-5: Granel (1197 kg/h)
+# 6,7,9,10,12,14,15: Manuales chicas M7,M8,M10,M11,M13,M15,M16 (589 kg/h)
+# 8,11,13: Manuales M9,M12,M14 (1197 kg/h)
+# 16-17: Cajoneras M17,M18 (304 kg/h)
+outlet_types:
+  - AUTO      # 0
+  - AUTO      # 1
+  - AUTO      # 2
+  - AUTO      # 3
+  - BULK      # 4 granel
+  - BULK      # 5 granel
+  - MANUAL    # 6 M7 manual chica
+  - MANUAL    # 7 M8 manual chica
+  - MANUAL_BULK   # 8 M9 (1197)
+  - MANUAL    # 9 M10 manual chica
+  - MANUAL    # 10 M11 manual chica
+  - MANUAL_BULK   # 11 M12 (1197)
+  - MANUAL    # 12 M13 manual chica
+  - MANUAL_BULK   # 13 M14 (1197)
+  - MANUAL    # 14 M15 manual chica
+  - MANUAL    # 15 M16 manual chica (589)
+  - CAJONERA  # 16 M17
+  - CAJONERA  # 17 M18
+
+# Velocidades en kg/h por tipo de salida
+speed_kgph:
+  AUTO: 2280
+  BULK: 1197
+  MANUAL: 589
+  MANUAL_BULK: 1197
+  CAJONERA: 304
+
+# --- Buffers ---
+buffer_kg_by_outlet:
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+  - 190
+
+# Bloqueo total (true): si cualquier calibre excede buffer, se detiene toda la entrada
+total_buffer_blocking: true
+
+# --- Asignación de calibre por salida ---
+# 18 salidas: asignar 80, 100 o 120 a cada una
+caliber_by_outlet:
+  - 100
+  - 100
+  - 100
+  - 100
+  - 120
+  - 120
+  - 80
+  - 80
+  - 100
+  - 100
+  - 80
+  - 120
+  - 100
+  - 120
+  - 80
+  - 80
+  - 100
+  - 120
+
+# --- Optimizador ---
+# Primeros N kg para basar la recomendación (opcional)
+# Si se define, se muestra además la recomendación basada en el tramo inicial
+optimizer_first_kg: 80000  # null para no calcular
+
+# --- Simulación ---
+n_seeds: 1                 # Número de repeticiones (1 = una sola seed)
+seed_base: 42              # Semilla base (cada corrida usa seed_base + i)
+
+# --- Logging de snapshots ---
+# Intervalo en minutos para mostrar estado del proceso (null para desactivar)
+snapshot_interval_minutes: 60

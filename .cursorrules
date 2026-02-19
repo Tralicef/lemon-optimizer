@@ -1,0 +1,8 @@
+Todo se corre en uv con uv run python ...
+UI gráfica: uv run streamlit run app.py
+La documentación se encuentra en los 4 .md que existen en el proyecto:
+- 00_overview.md
+- 01_simulador.md
+- 02_optimizador_v1.md
+- 03_optimizador_v2.md
+
