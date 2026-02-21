@@ -96,7 +96,7 @@ caliber_by_outlet:
 # --- Optimizador ---
 # Primeros N kg para basar la recomendación (opcional)
 # Si se define, se muestra además la recomendación basada en el tramo inicial
-optimizer_first_kg: 80000  # null para no calcular
+optimizer_first_kg: 120000  # null para no calcular
 
 # --- Simulación ---
 n_seeds: 1                 # Número de repeticiones (1 = una sola seed)
