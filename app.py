@@ -9,7 +9,9 @@ Ejecutar con: uv run streamlit run app.py
 import sys
 from pathlib import Path
 
+import hashlib
 import io
+import json
 import yaml
 
 import numpy as np
@@ -28,6 +30,21 @@ from lemon_packing.types import Assignment, PackingLineConfig, Snapshot
 from lemon_packing.sim.simpy_engine import run_simulation
 from lemon_packing.sim.metrics import results_to_dataframe
 from lemon_packing.opt import recommend_assignment
+from lemon_packing.scenarios import PREDEFINED_SCENARIOS, jensen_shannon_index
+
+
+def _sim_cache_key(farms, assignment, config, extra):
+    """Hash de los inputs que determinan optimizadores y simulaciones."""
+    farms_data = [(f.farm_id, dict(f.kg_by_caliber)) for f in farms]
+    key = json.dumps({
+        "farms": farms_data,
+        "assignment": assignment.caliber_by_outlet,
+        "arrival": extra["arrival_rate_kgph"],
+        "seed": extra["seed_base"],
+        "shift_hours": config.shift_hours,
+        "buffer": config.buffer_kg_by_outlet,
+    }, sort_keys=True)
+    return hashlib.md5(key.encode()).hexdigest()
 
 
 def _compute_composition_variability(farms, calibers, first_kg_limit=None):
@@ -96,6 +113,7 @@ st.set_page_config(
     page_title="Simulador Empaque Limones",
     page_icon="🍋",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 st.title("🍋 Simulador de Empaque de Limones")
@@ -105,9 +123,7 @@ st.caption("Visualización del flujo de limones: dónde están y cómo se mueven
 config_path = base / "configs" / "simulator_config.yaml"
 farms_csv = base / "data" / "farms.csv"
 
-# Sidebar (siempre visible)
-st.sidebar.header("Opciones")
-run_live = st.sidebar.checkbox("Ejecutar simulación en vivo", value=True)
+run_live = True  # Simulación siempre activada
 SNAPSHOT_INTERVAL_MIN = 5  # Fijo: cada 5 minutos
 
 # Inicializar session_state para overrides de configuración
@@ -116,13 +132,15 @@ if "config_overrides" not in st.session_state:
 if "farms_override" not in st.session_state:
     st.session_state["farms_override"] = None  # list[FarmLot] o None = usar CSV por defecto
 if "farms_source" not in st.session_state:
-    st.session_state["farms_source"] = "default"  # "default" | "upload" | "manual"
+    st.session_state["farms_source"] = "default"  # "upload" | "manual" (solo cuando custom)
+if "farms_scenario" not in st.session_state:
+    st.session_state["farms_scenario"] = "muy_bajo"  # muy_bajo | bajo | medio | alto | custom
 
 # Cargar config base desde YAML
 config, extra = load_simulator_config(config_path)
 
-# Pestañas: Configuración (para editar primero) y Simulación
-tab_config, tab_sim = st.tabs(["⚙️ Configuración", "🍋 Simulación"])
+# Pestañas: Configuración, Simulación y Análisis
+tab_config, tab_sim, tab_analisis = st.tabs(["⚙️ Configuración", "🍋 Simulación", "📊 Análisis"])
 
 # --- Pestaña Configuración ---
 with tab_config:
@@ -135,21 +153,41 @@ with tab_config:
     shift_hours = overrides.get("shift_hours", config.shift_hours)
 
     with st.expander("🍋 Datos de fincas", expanded=True):
-        st.caption("Elegí de dónde cargar los kg por calibre (80, 100, 120) de cada finca.")
-        farms_source = st.radio(
-            "Origen de datos",
-            options=["default", "upload", "manual"],
-            format_func=lambda x: {
-                "default": "Archivo por defecto (data/farms.csv)",
-                "upload": "Subir mi archivo CSV",
-                "manual": "Cargar a mano",
-            }[x],
-            key="farms_source_radio",
-            horizontal=True,
+        st.caption("Elegí un escenario predefinido (por índice Jensen-Shannon) o armá uno propio.")
+        scenario_options = [
+            (s.id, f"{s.name} — JSD {s.jensen_shannon:.3f}") for s in PREDEFINED_SCENARIOS
+        ] + [("custom", "Personalizado (subir CSV o manual)")]
+        scenario_labels = [opt[1] for opt in scenario_options]
+        scenario_ids = [opt[0] for opt in scenario_options]
+        sel_idx = scenario_ids.index(st.session_state.get("farms_scenario", "muy_bajo"))
+        sel_label = st.selectbox(
+            "Escenario",
+            options=range(len(scenario_options)),
+            format_func=lambda i: scenario_labels[i],
+            index=sel_idx,
+            key="scenario_select",
         )
-        st.session_state["farms_source"] = farms_source
+        farms_scenario = scenario_ids[sel_label]
+        st.session_state["farms_scenario"] = farms_scenario
 
-        if farms_source == "upload":
+        if farms_scenario == "custom":
+            farms_source = st.radio(
+                "Origen personalizado",
+                options=["upload", "manual"],
+                format_func=lambda x: {"upload": "Subir mi archivo CSV", "manual": "Cargar a mano"}[x],
+                key="farms_source_radio",
+                horizontal=True,
+            )
+            st.session_state["farms_source"] = farms_source
+            # farms_override se setea en los bloques upload/manual cuando hay datos
+        else:
+            st.session_state["farms_source"] = None
+            scenario = next(s for s in PREDEFINED_SCENARIOS if s.id == farms_scenario)
+            st.session_state["farms_override"] = scenario.farms
+            st.success(f"✓ Escenario **{scenario.name}**: {len(scenario.farms)} fincas, JSD = {scenario.jensen_shannon:.3f}")
+            st.caption(scenario.description)
+
+        if farms_scenario == "custom" and st.session_state.get("farms_source") == "upload":
             uploaded = st.file_uploader(
                 "Subí un CSV con columnas: finca, 80, 100, 120",
                 type=["csv"],
@@ -165,13 +203,13 @@ with tab_config:
                     st.error(f"Error al leer el CSV: {e}")
                     if st.session_state.get("farms_override"):
                         del st.session_state["farms_override"]
-            elif st.session_state.get("farms_override") and "upload" in str(st.session_state.get("farms_source", "")):
+            elif st.session_state.get("farms_override"):
                 pass  # mantener override previo si ya había subido
             else:
                 st.session_state["farms_override"] = None
                 st.info("Subí un archivo CSV para usarlo.")
 
-        elif farms_source == "manual":
+        elif farms_scenario == "custom" and st.session_state.get("farms_source") == "manual":
             # Cargar datos base: override previo (upload o manual) o CSV por defecto
             if st.session_state.get("farms_override"):
                 default_df = farms_to_dataframe(st.session_state["farms_override"])
@@ -205,13 +243,9 @@ with tab_config:
             else:
                 st.session_state["farms_override"] = None
 
-        else:  # default
+        elif farms_scenario == "custom":
             st.session_state["farms_override"] = None
-            try:
-                default_farms = load_farms_from_csv(farms_csv)
-                st.success(f"✓ Se usará el archivo por defecto ({len(default_farms)} fincas).")
-            except Exception as e:
-                st.error(f"No se pudo cargar el archivo por defecto: {e}")
+            st.info("Elegí subir CSV o cargar a mano arriba.")
 
     with st.expander("📋 Asignación calibre por salida", expanded=True):
         st.caption("Cada salida procesa un calibre. Seleccioná 80, 100 o 120 para cada salida.")
@@ -393,25 +427,69 @@ with tab_sim:
             st.stop()
     farms_obj = farms
 
-    # Ejecutar simulación con captura de snapshots
-    snapshots: list[Snapshot] = []
-    result_obj = None
     assignment_obj = Assignment(caliber_by_outlet=extra["caliber_by_outlet"])
+    cache_key = _sim_cache_key(farms, assignment_obj, config_obj, extra) + f"_{run_live}"
 
-    # Optimizador: primeros N kg (parametrizable)
-    opt_first_kg = extra.get("optimizer_first_kg", 120000)
-    opt_result_first = recommend_assignment(config_obj, farms, first_kg_limit=opt_first_kg)
+    # Usar cache si los inputs no cambiaron (ej. solo se movió el slider de momento)
+    cached = (
+        st.session_state.get("sim_cache_key") == cache_key
+        and st.session_state.get("opt_empleado") is not None
+        and st.session_state.get("opt_milp") is not None
+    )
 
-    if run_live:
-        with st.spinner("Ejecutando simulación y capturando snapshots..."):
-            r = run_simulation(
-                config_obj, farms, assignment_obj,
-                extra["arrival_rate_kgph"],
-                extra["seed_base"],
-                snapshot_interval_minutes=SNAPSHOT_INTERVAL_MIN,
-                snapshots_out=snapshots,
+    if cached:
+        opt_empleado = st.session_state["opt_empleado"]
+        opt_milp = st.session_state["opt_milp"]
+        result_obj = st.session_state.get("result_obj")
+        result_empleado = st.session_state.get("result_empleado")
+        result_milp = st.session_state.get("result_milp")
+        snapshots = st.session_state.get("snapshots", [])
+    else:
+        # Empleado actual: promedio de calibres, heurística (instantáneo)
+        opt_empleado = recommend_assignment(
+            config_obj, farms,
+            first_kg_limit=extra.get("optimizer_first_kg", 120000),
+        )
+        # Optimizador automático: maximiza kg procesados explícitamente (min-cost flow + simulación)
+        with st.spinner("Calculando optimizador automático (maximiza kg procesados)..."):
+            opt_milp = recommend_assignment(
+                config_obj, farms, first_kg_limit=None, force_milp=True,
+                use_mincost_style=True,
+                arrival_rate_kgph=extra["arrival_rate_kgph"], seed=extra["seed_base"],
             )
-            result_obj = r
+
+        snapshots = []
+        result_obj = None
+        result_empleado = None
+        result_milp = None
+        if run_live:
+            seed = extra["seed_base"]
+            with st.spinner("Ejecutando 3 simulaciones (misma seed) para comparar kg procesados..."):
+                result_obj = run_simulation(
+                    config_obj, farms, assignment_obj,
+                    extra["arrival_rate_kgph"], seed,
+                    snapshot_interval_minutes=SNAPSHOT_INTERVAL_MIN,
+                    snapshots_out=snapshots,
+                )
+                result_empleado = run_simulation(
+                    config_obj, farms, Assignment(caliber_by_outlet=opt_empleado.caliber_by_outlet),
+                    extra["arrival_rate_kgph"], seed,
+                )
+                result_milp = run_simulation(
+                    config_obj, farms, Assignment(caliber_by_outlet=opt_milp.caliber_by_outlet),
+                    extra["arrival_rate_kgph"], seed,
+                )
+
+        # Guardar en cache para no recalcular al mover el slider
+        st.session_state["sim_cache_key"] = cache_key
+        st.session_state["opt_empleado"] = opt_empleado
+        st.session_state["opt_milp"] = opt_milp
+        st.session_state["result_obj"] = result_obj
+        st.session_state["result_empleado"] = result_empleado
+        st.session_state["result_milp"] = result_milp
+        st.session_state["snapshots"] = snapshots
+
+    opt_first_kg = extra.get("optimizer_first_kg", 120000)  # para variabilidad
 
     # --- Asignaciones: Tu asignación vs Optimizador primeros 80 000 kg ---
     st.header("📋 Asignación calibre-salida")
@@ -435,14 +513,17 @@ with tab_sim:
 
     # Variabilidad de composición
     var_total, var_first = _compute_composition_variability(farms, calibers, opt_first_kg)
-    var_col1, var_col2 = st.columns(2)
+    jsd_actual = jensen_shannon_index(farms, calibers)
+    var_col1, var_col2, var_col3 = st.columns(3)
     with var_col1:
         st.caption(f"**Variabilidad composición (total):** {var_total:.3f} — desv. estándar de proporciones entre fincas (0 = todas iguales)")
     with var_col2:
         if var_first is not None:
             st.caption(f"**Variabilidad primeros {opt_first_kg:,.0f} kg vs total:** {var_first:.3f} — diferencia entre mix inicial y global")
+    with var_col3:
+        st.caption(f"**Índice Jensen-Shannon:** {jsd_actual:.3f} — diferencia entre composiciones de fincas (0 = iguales, 1 = máx. distintas)")
 
-    cols = st.columns(2)
+    cols = st.columns(3)
     with cols[0]:
         st.subheader("Tu asignación")
         cap_tu = {c: 0 for c in prop_esperadas}
@@ -457,38 +538,54 @@ with tab_sim:
                 f"c{c}={100*cap_tu[c]/total_cap:.1f}%" for c in sorted(cap_tu)))
         # Throughput real = resultado de simular con TU asignación
         if run_live and result_obj is not None:
-            thru_sim = result_obj.total_packed_kg / config_obj.shift_hours if config_obj.shift_hours > 0 else 0
-            st.metric("Throughput real (tu asignación)", f"{thru_sim:,.0f} kg/h", "lo que realmente se sostiene")
+            kg_tu = result_obj.total_packed_kg
+            pct_tu = (100 * kg_tu / total_kg) if total_kg > 0 else 0
+            st.metric("Kg procesados", f"{kg_tu:,.0f} kg", f"{pct_tu:.1f}% del total")
+        st.caption("_Para pruebas_")
 
     with cols[1]:
-        st.subheader(f"Optimizador: primeros {opt_first_kg:,.0f} kg")
-        prop_first = opt_result_first.proportions_used or {}
-        st.caption("Proporciones del tramo: " + ", ".join(
-            f"c{c}={100*prop_first.get(c,0):.1f}%" for c in sorted(prop_first)))
-        total_cap_first = sum(opt_result_first.capacity_by_caliber.values())
-        for m, c in enumerate(opt_result_first.caliber_by_outlet):
+        st.subheader("Empleado actual")
+        prop_emp = opt_empleado.proportions_used or {}
+        first_kg = extra.get("optimizer_first_kg", 120000)
+        st.caption(f"Mix de demanda (primeros {first_kg:,.0f} kg): " + ", ".join(
+            f"c{c}={100*prop_emp.get(c,0):.1f}%" for c in sorted(prop_emp)))
+        for m, c in enumerate(opt_empleado.caliber_by_outlet):
             tipo = config_obj.outlet_types[m]
             st.write(f"Salida #{m}: calibre {c} ({tipo})")
-        if total_cap_first > 0:
-            st.caption("Capacidad: " + ", ".join(
-                f"c{c}={100*opt_result_first.capacity_by_caliber[c]/total_cap_first:.1f}%"
-                for c in sorted(opt_result_first.capacity_by_caliber)))
-        pct_max_first = (100 * opt_result_first.lambda_star / total_cap_first) if total_cap_first > 0 else 0
-        st.metric("λ* (asignación optimizador)", f"{opt_result_first.lambda_star:,.0f} kg/h", f"{pct_max_first:.1f}% de capacidad")
-        st.caption(
-            "**λ* de esta asignación sugerida:** Máximo teórico si usaras esta asignación y el mix llegara perfectamente balanceado. "
-            "No es sostenible en la práctica (mezcla estocástica → bloqueo). El throughput real de tu asignación está a la izquierda."
-        )
-        if st.button("Usar esta asignación", key="apply_opt_first"):
+        if run_live and result_empleado is not None:
+            kg_emp = result_empleado.total_packed_kg
+            pct_emp = (100 * kg_emp / total_kg) if total_kg > 0 else 0
+            delta_emp = kg_emp - result_obj.total_packed_kg if result_obj else 0
+            delta_str = f"{delta_emp:+,.0f} kg vs tu asignación" if result_obj else f"{pct_emp:.1f}% del total"
+            st.metric("Kg procesados", f"{kg_emp:,.0f} kg", delta_str)
+        st.caption(f"Match capacidad ↔ demanda de los **primeros {first_kg:,.0f} kg** (heurística).")
+        if st.button("Usar esta asignación", key="apply_opt_empleado"):
             prev = st.session_state.get("config_overrides") or {}
-            st.session_state["config_overrides"] = {**prev, "caliber_by_outlet": list(opt_result_first.caliber_by_outlet)}
+            st.session_state["config_overrides"] = {**prev, "caliber_by_outlet": list(opt_empleado.caliber_by_outlet)}
+            st.rerun()
+
+    with cols[2]:
+        st.subheader("Optimizador automático")
+        prop_milp = opt_milp.proportions_used or {}
+        st.caption("Proporciones (promedio): " + ", ".join(
+            f"c{c}={100*prop_milp.get(c,0):.1f}%" for c in sorted(prop_milp)))
+        for m, c in enumerate(opt_milp.caliber_by_outlet):
+            tipo = config_obj.outlet_types[m]
+            st.write(f"Salida #{m}: calibre {c} ({tipo})")
+        if run_live and result_milp is not None:
+            kg_milp = result_milp.total_packed_kg
+            pct_milp = (100 * kg_milp / total_kg) if total_kg > 0 else 0
+            delta_milp = kg_milp - result_obj.total_packed_kg if result_obj else 0
+            delta_str = f"{delta_milp:+,.0f} kg vs tu asignación" if result_obj else f"{pct_milp:.1f}% del total"
+            st.metric("Kg procesados", f"{kg_milp:,.0f} kg", delta_str)
+        st.caption("**Programación lineal entera** — robusto para todas las fincas.")
+        if st.button("Usar esta asignación", key="apply_opt_milp"):
+            prev = st.session_state.get("config_overrides") or {}
+            st.session_state["config_overrides"] = {**prev, "caliber_by_outlet": list(opt_milp.caliber_by_outlet)}
             st.rerun()
 
     if not snapshots:
-        st.info(
-            "Ejecutá la simulación con **Ejecutar simulación en vivo** activado para ver "
-            "el flujo de limones en el tiempo."
-        )
+        st.info("Esperando resultados de la simulación para ver el flujo de limones en el tiempo.")
     else:
         # --- Slider de tiempo ---
         st.header("🕐 Momento en el turno")
@@ -932,3 +1029,249 @@ with tab_sim:
             k3.metric("Tiempo bloqueo", f"{row['blocked_time_infeed_hours']:.2f} h")
             df_display = results_to_dataframe([result_obj]).drop(columns=["seed"], errors="ignore")
             st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+# --- Pestaña Análisis ---
+with tab_analisis:
+    st.header("📊 Análisis comparativo")
+    st.caption("Comparación Empleado vs Optimizador automático por escenario JSD, e impacto de agregar una máquina.")
+
+    seed = extra["seed_base"]
+    arrival = extra["arrival_rate_kgph"]
+
+    def _total_capacity_kgph(config):
+        """Capacidad total del sistema en kg/h."""
+        return sum(config.speed_kgph[t] for t in config.outlet_types)
+
+    def _config_with_extra_outlet(base_config, outlet_type="AUTO", buffer_kg=190):
+        """Config con una máquina adicional."""
+        new_types = list(base_config.outlet_types) + [outlet_type]
+        base_buffers = base_config.buffer_kg_by_outlet or [190] * len(base_config.outlet_types)
+        new_buffers = list(base_buffers) + [buffer_kg]
+        return PackingLineConfig(
+            shift_hours=base_config.shift_hours,
+            dt_seconds=base_config.dt_seconds,
+            outlet_types=new_types,
+            speed_kgph=base_config.speed_kgph,
+            buffer_kg_by_outlet=new_buffers,
+            total_buffer_blocking=base_config.total_buffer_blocking,
+        )
+
+    def _config_with_scaled_buffers(base_config, scale: float):
+        """Config con buffers escalados (ej. 1.5 = +50%, 2 = +100%, 4 = +300%)."""
+        base_buffers = base_config.buffer_kg_by_outlet or [190] * len(base_config.outlet_types)
+        new_buffers = [b * scale for b in base_buffers]
+        return PackingLineConfig(
+            shift_hours=base_config.shift_hours,
+            dt_seconds=base_config.dt_seconds,
+            outlet_types=base_config.outlet_types,
+            speed_kgph=base_config.speed_kgph,
+            buffer_kg_by_outlet=new_buffers,
+            total_buffer_blocking=base_config.total_buffer_blocking,
+        )
+
+    run_analisis = st.button("🔄 Calcular análisis", key="run_analisis")
+    if run_analisis:
+        st.session_state.pop("analisis_results", None)
+
+    if run_analisis:
+        # Análisis 1: Empleado vs Optimizador (optimizador = mejor de MILP y heurística, siempre >= empleado)
+        rows_comp = []
+        progress = st.progress(0, text="Analizando escenarios...")
+        n_scen = len(PREDEFINED_SCENARIOS)
+        n_phases = 3  # comp, maq, buffers
+        for i, scenario in enumerate(PREDEFINED_SCENARIOS):
+            progress.progress((i + 0.3) / (n_scen * n_phases), text=f"Empleado vs Optimizador: {scenario.name}...")
+            opt_emp = recommend_assignment(
+                config_obj, scenario.farms,
+                first_kg_limit=extra.get("optimizer_first_kg", 120000),
+            )
+            r_emp = run_simulation(config_obj, scenario.farms, Assignment(opt_emp.caliber_by_outlet), arrival, seed)
+            with st.spinner(f"Optimizador para {scenario.name}..."):
+                opt_milp_s = recommend_assignment(
+                    config_obj, scenario.farms, first_kg_limit=None, force_milp=True,
+                    use_mincost_style=True,
+                    arrival_rate_kgph=arrival, seed=seed, local_search=False,
+                )
+            r_milp = run_simulation(config_obj, scenario.farms, Assignment(opt_milp_s.caliber_by_outlet), arrival, seed)
+            # Optimizador maximiza kg explícitamente (siempre >= empleado)
+            diff = r_milp.total_packed_kg - r_emp.total_packed_kg
+            pct_mejora = (100 * diff / r_emp.total_packed_kg) if r_emp.total_packed_kg > 0 else 0
+            rows_comp.append({
+                "Escenario": scenario.name,
+                "JSD": round(scenario.jensen_shannon, 3),
+                "Kg Empleado": round(r_emp.total_packed_kg, 0),
+                "Kg Optimizador": round(r_milp.total_packed_kg, 0),
+                "Diferencia (kg)": round(diff, 0),
+                "% mejora": round(pct_mejora, 2),
+            })
+
+        # Análisis 2: Impacto de agregar una máquina (Optimizador vs Optimizador con máquina nueva)
+        maq_tipo = "AUTO"
+        maq_velocidad = config_obj.speed_kgph.get(maq_tipo, 2280)
+        cap_total_18 = _total_capacity_kgph(config_obj)
+        pct_cap_agregada = 100 * maq_velocidad / cap_total_18 if cap_total_18 > 0 else 0
+        config_19 = _config_with_extra_outlet(config_obj, outlet_type=maq_tipo)
+
+        rows_maq = []
+        for i, scenario in enumerate(PREDEFINED_SCENARIOS):
+            progress.progress((n_scen * 1 + i + 0.3) / (n_scen * n_phases), text=f"Agregar máquina {maq_tipo}: {scenario.name}...")
+            opt_18 = recommend_assignment(
+                config_obj, scenario.farms, first_kg_limit=None, force_milp=True,
+                use_mincost_style=True, arrival_rate_kgph=arrival, seed=seed,
+                local_search=False,
+            )
+            r_18 = run_simulation(config_obj, scenario.farms, Assignment(opt_18.caliber_by_outlet), arrival, seed)
+            opt_19 = recommend_assignment(
+                config_19, scenario.farms, first_kg_limit=None, force_milp=True,
+                use_mincost_style=True, arrival_rate_kgph=arrival, seed=seed,
+                local_search=False,
+            )
+            r_19 = run_simulation(config_19, scenario.farms, Assignment(opt_19.caliber_by_outlet), arrival, seed)
+            diff_maq = r_19.total_packed_kg - r_18.total_packed_kg
+            pct_maq = (100 * diff_maq / r_18.total_packed_kg) if r_18.total_packed_kg > 0 else 0
+            # Ratio: mejora en kg / mejora en capacidad (si agregamos X% capacidad, cuánto % más kg)
+            ratio_ef = (pct_maq / pct_cap_agregada) if pct_cap_agregada > 0 else 0
+            rows_maq.append({
+                "Escenario": scenario.name,
+                "JSD": round(scenario.jensen_shannon, 3),
+                "Kg (18 máq)": round(r_18.total_packed_kg, 0),
+                "Kg (19 máq)": round(r_19.total_packed_kg, 0),
+                "Diferencia (kg)": round(diff_maq, 0),
+                "% mejora kg": round(pct_maq, 2),
+                "% cap. agregada": round(pct_cap_agregada, 1),
+                "Ratio mejora/cap": round(ratio_ef, 2),
+            })
+
+        # Análisis 3: Impacto de aumentar buffers (+50%, +100%, +300%)
+        buffer_scales = [(1.5, "+50%"), (2.0, "+100%"), (4.0, "+300%")]
+        rows_buf = []
+        n_total = n_scen * 2 + n_scen * len(buffer_scales)
+        for scale, label in buffer_scales:
+            config_buf = _config_with_scaled_buffers(config_obj, scale)
+            for i, scenario in enumerate(PREDEFINED_SCENARIOS):
+                idx = n_scen * 2 + buffer_scales.index((scale, label)) * n_scen + i
+                progress.progress((idx + 0.5) / n_total, text=f"Buffers {label}: {scenario.name}...")
+                opt_base = recommend_assignment(
+                    config_obj, scenario.farms, first_kg_limit=None, force_milp=True,
+                    use_mincost_style=True, arrival_rate_kgph=arrival, seed=seed,
+                    local_search=False,
+                )
+                opt_buf = recommend_assignment(
+                    config_buf, scenario.farms, first_kg_limit=None, force_milp=True,
+                    use_mincost_style=True, arrival_rate_kgph=arrival, seed=seed,
+                    local_search=False,
+                )
+                r_base = run_simulation(config_obj, scenario.farms, Assignment(opt_base.caliber_by_outlet), arrival, seed)
+                r_buf = run_simulation(config_buf, scenario.farms, Assignment(opt_buf.caliber_by_outlet), arrival, seed)
+                diff_buf = r_buf.total_packed_kg - r_base.total_packed_kg
+                pct_buf = (100 * diff_buf / r_base.total_packed_kg) if r_base.total_packed_kg > 0 else 0
+                rows_buf.append({
+                    "Escenario": scenario.name,
+                    "JSD": round(scenario.jensen_shannon, 3),
+                    "Buffers": label,
+                    "Kg (base)": round(r_base.total_packed_kg, 0),
+                    "Kg (buffers)": round(r_buf.total_packed_kg, 0),
+                    "Diferencia (kg)": round(diff_buf, 0),
+                    "% mejora": round(pct_buf, 2),
+                })
+
+        progress.progress(1.0, text="Listo.")
+        st.session_state["analisis_results"] = {
+            "comp": rows_comp,
+            "maq": rows_maq,
+            "maq_tipo": maq_tipo,
+            "maq_velocidad": maq_velocidad,
+            "pct_cap_agregada": pct_cap_agregada,
+            "buf": rows_buf,
+        }
+
+    if st.session_state.get("analisis_results"):
+        rows_comp = st.session_state["analisis_results"]["comp"]
+        rows_maq = st.session_state["analisis_results"]["maq"]
+        rows_buf = st.session_state["analisis_results"].get("buf", [])
+        maq_tipo = st.session_state["analisis_results"].get("maq_tipo", "AUTO")
+        pct_cap = st.session_state["analisis_results"].get("pct_cap_agregada", 0)
+
+        st.subheader("1. Empleado actual vs Optimizador automático por escenario JSD")
+        st.caption("El optimizador maximiza kg procesados explícitamente (simula candidatos y elige el mejor).")
+        df_comp = pd.DataFrame(rows_comp)
+        st.dataframe(df_comp, use_container_width=True, hide_index=True)
+        fig_comp = go.Figure()
+        fig_comp.add_trace(go.Bar(name="Empleado", x=[r["Escenario"] for r in rows_comp], y=[r["Kg Empleado"] for r in rows_comp]))
+        fig_comp.add_trace(go.Bar(name="Optimizador", x=[r["Escenario"] for r in rows_comp], y=[r["Kg Optimizador"] for r in rows_comp]))
+        fig_comp.update_layout(barmode="group", title="Kg procesados por escenario", xaxis_title="Escenario", yaxis_title="kg")
+        st.plotly_chart(fig_comp, use_container_width=True)
+        fig_diff = go.Figure(go.Bar(x=[r["Escenario"] for r in rows_comp], y=[r["% mejora"] for r in rows_comp]))
+        fig_diff.update_layout(title="% mejora del Optimizador vs Empleado por escenario", xaxis_title="Escenario", yaxis_title="% mejora")
+        st.plotly_chart(fig_diff, use_container_width=True)
+        # Gráfico: cómo varía la mejora con el JSD (eje X numérico)
+        fig_jsd = go.Figure(go.Scatter(
+            x=[r["JSD"] for r in rows_comp],
+            y=[r["% mejora"] for r in rows_comp],
+            mode="lines+markers+text",
+            text=[r["Escenario"] for r in rows_comp],
+            textposition="top center",
+        ))
+        fig_jsd.update_layout(
+            title="% mejora Optimizador vs Empleado según índice Jensen-Shannon",
+            xaxis_title="Índice JSD (variabilidad entre fincas)",
+            yaxis_title="% mejora",
+        )
+        st.plotly_chart(fig_jsd, use_container_width=True)
+
+        st.subheader("2. Impacto de agregar una máquina automática")
+        st.caption(f"Optimizador vs Optimizador con +1 máquina **{maq_tipo}** (2280 kg/h). Se agrega ~{pct_cap:.1f}% de capacidad total.")
+        df_maq = pd.DataFrame(rows_maq)
+        st.dataframe(df_maq, use_container_width=True, hide_index=True)
+        st.caption("**Ratio mejora/cap**: cuántas veces la mejora en kg supera la capacidad agregada (1 = proporcional, <1 = rendimientos decrecientes).")
+        fig_maq = go.Figure()
+        fig_maq.add_trace(go.Bar(name="18 máq", x=[r["Escenario"] for r in rows_maq], y=[r["Kg (18 máq)"] for r in rows_maq]))
+        fig_maq.add_trace(go.Bar(name="19 máq", x=[r["Escenario"] for r in rows_maq], y=[r["Kg (19 máq)"] for r in rows_maq]))
+        fig_maq.update_layout(barmode="group", title=f"Kg procesados: 18 vs 19 máquinas (+1 {maq_tipo})", xaxis_title="Escenario", yaxis_title="kg")
+        st.plotly_chart(fig_maq, use_container_width=True)
+        fig_maq_pct = go.Figure(go.Bar(x=[r["Escenario"] for r in rows_maq], y=[r["% mejora kg"] for r in rows_maq]))
+        fig_maq_pct.update_layout(title=f"% mejora kg al agregar 1 {maq_tipo} (~{pct_cap:.1f}% más capacidad)", xaxis_title="Escenario", yaxis_title="% mejora")
+        st.plotly_chart(fig_maq_pct, use_container_width=True)
+        fig_maq_ratio = go.Figure(go.Bar(x=[r["Escenario"] for r in rows_maq], y=[r["Ratio mejora/cap"] for r in rows_maq]))
+        fig_maq_ratio.update_layout(title="Ratio: % mejora kg / % capacidad agregada (1 = proporcional)", xaxis_title="Escenario", yaxis_title="Ratio")
+        st.plotly_chart(fig_maq_ratio, use_container_width=True)
+        # Gráfico: cómo varía el impacto de agregar máquina con el JSD
+        fig_maq_jsd = go.Figure(go.Scatter(
+            x=[r["JSD"] for r in rows_maq],
+            y=[r["% mejora kg"] for r in rows_maq],
+            mode="lines+markers+text",
+            text=[r["Escenario"] for r in rows_maq],
+            textposition="top center",
+        ))
+        fig_maq_jsd.update_layout(
+            title="% mejora al agregar 1 máquina según índice Jensen-Shannon",
+            xaxis_title="Índice JSD (variabilidad entre fincas)",
+            yaxis_title="% mejora",
+        )
+        st.plotly_chart(fig_maq_jsd, use_container_width=True)
+
+        st.subheader("3. Impacto de aumentar el tamaño de los buffers")
+        st.caption("Optimizador con buffers base vs +50%, +100% y +300% de capacidad de buffer.")
+        if rows_buf:
+            df_buf = pd.DataFrame(rows_buf)
+            st.dataframe(df_buf, use_container_width=True, hide_index=True)
+            escenarios = list(dict.fromkeys(r["Escenario"] for r in rows_buf))
+            fig_buf = go.Figure()
+            def _get(e, label, col):
+                for r in rows_buf:
+                    if r["Escenario"] == e and r["Buffers"] == label:
+                        return r[col]
+                return 0
+
+            fig_buf.add_trace(go.Bar(name="Base", x=escenarios, y=[_get(e, "+50%", "Kg (base)") for e in escenarios]))
+            for label in ["+50%", "+100%", "+300%"]:
+                fig_buf.add_trace(go.Bar(name=f"Buffers {label}", x=escenarios, y=[_get(e, label, "Kg (buffers)") for e in escenarios]))
+            fig_buf.update_layout(barmode="group", title="Kg procesados según tamaño de buffers", xaxis_title="Escenario", yaxis_title="kg")
+            st.plotly_chart(fig_buf, use_container_width=True)
+            fig_buf_pct = go.Figure()
+            for label in ["+50%", "+100%", "+300%"]:
+                fig_buf_pct.add_trace(go.Bar(name=label, x=escenarios, y=[_get(e, label, "% mejora") for e in escenarios]))
+            fig_buf_pct.update_layout(title="% mejora al aumentar buffers por escenario", xaxis_title="Escenario", yaxis_title="% mejora")
+            st.plotly_chart(fig_buf_pct, use_container_width=True)
+    else:
+        st.info("Hacé clic en **Calcular análisis** para ejecutar los análisis (usa min-cost flow).")
