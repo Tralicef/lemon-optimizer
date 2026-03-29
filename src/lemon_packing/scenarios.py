@@ -221,3 +221,36 @@ def _make_scenarios() -> List[Scenario]:
 
 
 PREDEFINED_SCENARIOS = _make_scenarios()
+
+# Etiqueta para el análisis que promedia los 4 escenarios con el mismo peso
+ANALISIS_COMBINADO_LABEL = "Combinado (4 escenarios, peso igual)"
+
+
+def merge_scenarios_equal_weight(
+    scenarios: List[Scenario],
+    calibers: List[int] = None,
+    target_kg: float = TARGET_KG_PER_SCENARIO,
+) -> List[FarmLot]:
+    """
+    Promedia los kg por finca y calibre entre todos los escenarios (mismo peso cada uno)
+    y reescala el total a target_kg. Misma estructura de fincas (mismos farm_id) en cada escenario.
+    """
+    if calibers is None:
+        calibers = [80, 100, 120]
+    if not scenarios:
+        return []
+    n = len(scenarios)
+    ids = [f.farm_id for f in scenarios[0].farms]
+    merged: List[FarmLot] = []
+    for fid in ids:
+        kg_acc = {c: 0.0 for c in calibers}
+        for scen in scenarios:
+            farm = next((f for f in scen.farms if f.farm_id == fid), None)
+            if farm is None:
+                continue
+            for c in calibers:
+                kg_acc[c] += farm.kg_by_caliber.get(c, 0.0)
+        for c in calibers:
+            kg_acc[c] /= float(n)
+        merged.append(FarmLot(farm_id=fid, kg_by_caliber=kg_acc))
+    return _scale_farms_to_total(merged, target_kg)
