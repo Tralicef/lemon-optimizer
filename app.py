@@ -140,17 +140,72 @@ def _payback_years_simple(capex: float, annual_net: float):
     return float(capex) / float(annual_net)
 
 
-def _cashflow_rows(capex: float, annual_net: float, n_years_after_t0: int):
-    """Filas t0 + años: flujo por período y acumulado (USD)."""
-    rows = []
+def _npv_capex_annuity(capex: float, annual_net: float, n_years: int, r_annual: float) -> float:
+    """VPN = −CAPEX + valor presente de anualidad constante de n años (flujos al cierre de cada año)."""
+    n_years = int(max(0, n_years))
+    capex = float(capex)
+    a = float(annual_net)
+    r = float(r_annual)
+    if n_years <= 0:
+        return -capex
+    if r <= 1e-12:
+        return -capex + a * n_years
+    pv_inflows = a * (1.0 - (1.0 + r) ** (-n_years)) / r
+    return -capex + pv_inflows
+
+
+def _discounted_payback_years(capex: float, annual_net: float, r_annual: float, max_years: int = 500) -> float | None:
+    """Años hasta que el VPN acumulado (flujos descontados a t0) sea ≥ 0; fracción dentro del año que cruza."""
+    if annual_net <= 1e-9 or capex <= 0:
+        return None
+    r = float(r_annual)
+    a = float(annual_net)
     cum = -float(capex)
+    for y in range(1, max_years + 1):
+        disc = a / ((1.0 + r) ** y)
+        prev_cum = cum
+        cum += disc
+        if cum >= -1e-9:
+            if disc > 1e-18 and prev_cum < -1e-9:
+                frac = -prev_cum / disc
+                frac = max(0.0, min(1.0, frac))
+            else:
+                frac = 1.0 if prev_cum < 0 else 0.0
+            return float(y - 1) + frac
+    return None
+
+
+def _cashflow_rows_discounted(capex: float, annual_net: float, n_years_after_t0: int, r_annual: float):
+    """Filas t0 + años: flujo nominal, factor 1/(1+r)^t, flujo actualizado y VPN acumulado."""
+    rows = []
+    r = float(r_annual)
+    cum_npv = 0.0
+    capex = float(capex)
+    a = float(annual_net)
+    df0 = 1.0
+    disc0 = -capex * df0
+    cum_npv += disc0
     rows.append(
-        {"Período": "t0 (inversión)", "Flujo (USD)": round(-capex, 2), "Acumulado (USD)": round(cum, 2)}
+        {
+            "Período": "t0 (inversión)",
+            "Flujo nominal (USD)": round(-capex, 2),
+            "Factor desc.": round(df0, 6),
+            "Flujo actualizado (USD)": round(disc0, 2),
+            "VPN acumulado (USD)": round(cum_npv, 2),
+        }
     )
     for y in range(1, n_years_after_t0 + 1):
-        cum += annual_net
+        df = 1.0 / ((1.0 + r) ** y)
+        disc = a * df
+        cum_npv += disc
         rows.append(
-            {"Período": f"Año {y}", "Flujo (USD)": round(annual_net, 2), "Acumulado (USD)": round(cum, 2)}
+            {
+                "Período": f"Año {y}",
+                "Flujo nominal (USD)": round(a, 2),
+                "Factor desc.": round(df, 6),
+                "Flujo actualizado (USD)": round(disc, 2),
+                "VPN acumulado (USD)": round(cum_npv, 2),
+            }
         )
     return rows
 
@@ -177,6 +232,8 @@ def _st_df_money(df: pd.DataFrame):
             continue
         if "Δ kg" in c or "capacidad buffer" in cl:
             cfg[c] = NumberColumn(c, format="%.0f")
+        elif "factor desc" in cl:
+            cfg[c] = NumberColumn(c, format="%.6f")
         elif any(
             x in c
             for x in (
@@ -189,6 +246,7 @@ def _st_df_money(df: pd.DataFrame):
                 "Amort",
                 "Flujo",
                 "Acumulado",
+                "VPN",
                 "Ingreso",
                 "Balance",
                 "Total ",
@@ -1277,7 +1335,18 @@ with tab_analisis:
             value=15,
             step=1,
             key="econ_horizon_cf",
-            help="Cantidad de períodos anuales a mostrar en el flujo (además de t0).",
+            help="Cantidad de períodos anuales a mostrar en el flujo (además de t0). También define el horizonte del VPN en la tabla.",
+        )
+        econ_discount_rate_pct = st.number_input(
+            "Tasa de descuento anual (%, costo de oportunidad del capital)",
+            min_value=0.0,
+            max_value=50.0,
+            value=7.0,
+            step=0.5,
+            format="%.1f",
+            key="econ_discount_rate_pct",
+            help="Se usa para valor presente neto (VPN), payback descontado y flujos actualizados. "
+            "7% anual es un orden típico nominal para análisis de inversión (ajustá según WACC o política).",
         )
 
     run_analisis = st.button("🔄 Calcular análisis", key="run_analisis")
@@ -2033,19 +2102,23 @@ with tab_analisis:
             "**t0:** desembolso de CAPEX (salida de caja). **Años 1…N:** ingreso anual = "
             "Δ kg × margen/kg × **turnos efectivos/año** "
             f"({turnos_efectivos_por_año:.1f} = {econ_shifts_year} turnos referencia × {econ_months_operating}/12 meses). "
-            "No incluye impuestos, valor residual ni tasa de descuento; la amortización contable no es flujo de caja."
+            f"**Descuento:** **{econ_discount_rate_pct:.1f}%** anual sobre flujos al cierre de cada año (VPN y payback descontado). "
+            "No incluye impuestos ni valor residual; la amortización contable no es flujo de caja."
         )
         h_cf = int(econ_horizon_cf)
+        r_disc = float(econ_discount_rate_pct) / 100.0
         if econ_price_kg > 0 and econ_price_kg <= costo_var_kg:
             st.warning("Precio no supera costo variable: no hay flujo de recuperación con ese precio.")
         elif margen_kg <= 0:
             st.warning("Margen/kg no positivo: no hay flujos de recuperación.")
         else:
+            vpn_col = f"VPN ({h_cf} a) (USD)"
             breakeven_rows = []
             for r in rows_comp_econ:
                 dkg = float(r["Diferencia (kg)"])
                 gan_turno = dkg * margen_kg
                 ann = _annual_margin_usd(dkg, margen_kg, turnos_efectivos_por_año)
+                npv_row = round(_npv_capex_annuity(0.0, ann, h_cf, r_disc), 2)
                 breakeven_rows.append({
                     "Proyecto": f"OPT — {r['Escenario']}",
                     "Tipo": "Optimizador (sin CAPEX)",
@@ -2053,7 +2126,9 @@ with tab_analisis:
                     "CAPEX (USD)": 0.0,
                     "Margen/turno (USD)": round(gan_turno, 2),
                     "Margen anual (USD)": round(ann, 2),
+                    vpn_col: npv_row,
                     "Breakeven (años)": "— (sin inversión)",
+                    "Payback descont. (años)": "—",
                 })
             for maq_tipo in ("AUTO", "BULK"):
                 if maq_tipo not in maq_by_tipo_econ:
@@ -2064,6 +2139,8 @@ with tab_analisis:
                     gan_turno = dkg * margen_kg
                     ann = _annual_margin_usd(dkg, margen_kg, turnos_efectivos_por_año)
                     pb = _payback_years_simple(capex_m, ann)
+                    pb_d = _discounted_payback_years(capex_m, ann, r_disc)
+                    npv_row = round(_npv_capex_annuity(capex_m, ann, h_cf, r_disc), 2)
                     breakeven_rows.append({
                         "Proyecto": f"{maq_tipo} — {r['Escenario']}",
                         "Tipo": f"+1 máquina {maq_tipo}",
@@ -2071,7 +2148,9 @@ with tab_analisis:
                         "CAPEX (USD)": capex_m,
                         "Margen/turno (USD)": round(gan_turno, 2),
                         "Margen anual (USD)": round(ann, 2),
+                        vpn_col: npv_row,
                         "Breakeven (años)": round(pb, 2) if pb is not None else "—",
+                        "Payback descont. (años)": round(pb_d, 2) if pb_d is not None else "—",
                     })
             for rb in rows_econ_buf:
                 capex_b = float(rb.get("CAPEX buffer (USD)", 0) or 0)
@@ -2079,6 +2158,8 @@ with tab_analisis:
                 gan_turno = dkg * margen_kg
                 ann = _annual_margin_usd(dkg, margen_kg, turnos_efectivos_por_año)
                 pb = _payback_years_simple(capex_b, ann)
+                pb_d = _discounted_payback_years(capex_b, ann, r_disc)
+                npv_row = round(_npv_capex_annuity(capex_b, ann, h_cf, r_disc), 2)
                 breakeven_rows.append({
                     "Proyecto": f"BUF {rb['Buffers']} — {rb['Escenario']}",
                     "Tipo": f"Buffers {rb['Buffers']}",
@@ -2086,14 +2167,16 @@ with tab_analisis:
                     "CAPEX (USD)": capex_b,
                     "Margen/turno (USD)": round(gan_turno, 2),
                     "Margen anual (USD)": round(ann, 2),
+                    vpn_col: npv_row,
                     "Breakeven (años)": round(pb, 2) if pb is not None else "—",
+                    "Payback descont. (años)": round(pb_d, 2) if pb_d is not None else "—",
                 })
 
             df_br = pd.DataFrame(breakeven_rows)
             st.dataframe(df_br, use_container_width=True, hide_index=True, column_config=_st_df_money(df_br))
             st.caption(
-                "**Breakeven** = CAPEX ÷ margen anual (**payback simple**, sin descuento). "
-                "Con CAPEX = 0 solo hay beneficio recurrente (no hay capital que recuperar)."
+                f"**Payback simple** = CAPEX ÷ margen anual (sin descuento). **VPN ({h_cf} a)** y **payback descontado** "
+                f"usan **{econ_discount_rate_pct:.1f}%** anual. Con CAPEX = 0 el VPN es solo el valor presente del margen anual."
             )
 
             sel_cf = st.selectbox(
@@ -2104,31 +2187,37 @@ with tab_analisis:
             row_sel = next(x for x in breakeven_rows if x["Proyecto"] == sel_cf)
             capex_s = float(row_sel["CAPEX (USD)"])
             ann_s = float(row_sel["Margen anual (USD)"])
-            tbl_cf = _cashflow_rows(capex_s, ann_s, h_cf)
+            tbl_cf = _cashflow_rows_discounted(capex_s, ann_s, h_cf, r_disc)
             df_cf = pd.DataFrame(tbl_cf)
             st.dataframe(df_cf, use_container_width=True, hide_index=True, column_config=_st_df_money(df_cf))
             periods = [t["Período"] for t in tbl_cf]
-            flows = [t["Flujo (USD)"] for t in tbl_cf]
-            cums = [t["Acumulado (USD)"] for t in tbl_cf]
+            flows = [t["Flujo nominal (USD)"] for t in tbl_cf]
+            vpn_cum = [t["VPN acumulado (USD)"] for t in tbl_cf]
             fig_cf = go.Figure()
-            fig_cf.add_trace(go.Bar(x=periods, y=flows, name="Flujo neto (USD)"))
-            fig_cf.add_trace(go.Scatter(x=periods, y=cums, name="Acumulado (USD)", mode="lines+markers"))
-            fig_cf.update_yaxes(title_text="USD (mismo eje: flujo por período y acumulado)")
+            fig_cf.add_trace(go.Bar(x=periods, y=flows, name="Flujo nominal (USD)"))
+            fig_cf.add_trace(go.Scatter(x=periods, y=vpn_cum, name="VPN acumulado (USD)", mode="lines+markers"))
+            fig_cf.update_yaxes(title_text="USD (nominal por período; línea = VPN acumulado al desc.)")
             _plotly_usd_axis(fig_cf, secondary_y=False)
             fig_cf.update_layout(
-                title=f"Flujo de inversión: {sel_cf}",
+                title=f"Flujo de inversión: {sel_cf} (descuento {econ_discount_rate_pct:.1f}% anual)",
                 xaxis_title="Período",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02),
             )
-            st.plotly_chart(fig_cf, use_container_width=True)
+            st.plotly_chart(fig_cf, use_container_width=True, key="fig_cf_flujo_inversion")
             if capex_s > 1e-6 and ann_s > 1e-6:
                 pb = _payback_years_simple(capex_s, ann_s)
-                st.metric(
-                    "Breakeven (payback simple)",
-                    f"{pb:.2f} años" if pb is not None else "—",
-                )
+                pb_d = _discounted_payback_years(capex_s, ann_s, r_disc)
+                npv_sel = _npv_capex_annuity(capex_s, ann_s, h_cf, r_disc)
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Payback simple (años)", f"{pb:.2f}" if pb is not None else "—")
+                m2.metric("Payback descontado (años)", f"{pb_d:.2f}" if pb_d is not None else "—")
+                m3.metric(f"VPN ({h_cf} años)", f"${npv_sel:,.0f}")
             elif capex_s <= 1e-6:
-                st.info("Sin CAPEX en t0: el margen anual es beneficio recurrente directo.")
+                npv_op = _npv_capex_annuity(0.0, ann_s, h_cf, r_disc)
+                st.info(
+                    f"Sin CAPEX en t0: el margen anual es beneficio recurrente directo. "
+                    f"VPN ({h_cf} a) del margen: **${npv_op:,.0f}** al {econ_discount_rate_pct:.1f}% anual."
+                )
             else:
                 st.warning("Margen anual no positivo: no se alcanza recuperación del capital con estos supuestos.")
 
